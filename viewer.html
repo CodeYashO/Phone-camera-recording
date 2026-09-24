@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera Viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 14px; background: #111; color: #eee; max-width: 960px; margin: auto; }
+  video { width: 100%; background: #000; border-radius: 8px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+  select, button { font-size: 15px; padding: 9px 14px; border-radius: 8px; border: 0; background: #2a2a2a; color: #eee; }
+  button:hover { background: #3a3a3a; }
+  #live { background: #c62828; color: #fff; }
+  #clock { margin-left: auto; font-variant-numeric: tabular-nums; color: #8bc; }
+  #sessions button { background: #1e3a5f; }
+  #sessions button.active { background: #2e7d32; }
+  #info { font-size: 13px; color: #999; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:#666; margin-right:6px; }
+  .dot.on { background:#2e7; }
+</style>
+</head>
+<body>
+<h3 style="margin:4px 0 10px"><span class="dot" id="dot"></span>Camera Viewer</h3>
+<video id="v" controls autoplay muted playsinline></video>
+
+<div class="row">
+  <button id="back">&#9194; 10s</button>
+  <button id="fwd">10s &#9193;</button>
+  <button id="live">&#9679; LIVE</button>
+  <span id="clock"></span>
+</div>
+
+<div class="row">
+  <select id="cam"></select>
+  <select id="day"></select>
+</div>
+<div class="row" id="sessions"></div>
+<div id="info">Video starts muted (browser rule) - use the speaker icon on the player to hear audio.</div>
+
+<script>
+const v = document.getElementById("v");
+const $ = id => document.getElementById(id);
+let hls = null, currentUrl = null, followLive = false, daysData = [];
+
+function play(url, isLive) {
+  currentUrl = url;
+  followLive = isLive;
+  if (hls) { hls.destroy(); hls = null; }
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ liveSyncDurationCount: 2, backBufferLength: Infinity });
+    hls.loadSource(url);
+    hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
+    hls.on(Hls.Events.ERROR, (e, d) => {
+      if (!d.fatal) return;
+      // playlist may not exist yet for the first few seconds of a new session
+      setTimeout(() => { if (currentUrl === url && hls) hls.loadSource(url); }, 3000);
+    });
+  } else {
+    v.src = url;                       // Safari plays HLS natively
+    v.play().catch(() => {});
+  }
+  highlight();
+}
+
+function seekBy(sec) {
+  const r = v.seekable;
+  if (!r.length) return;
+  v.currentTime = Math.min(r.end(r.length - 1), Math.max(r.start(0), v.currentTime + sec));
+}
+
+async function goLive() {
+  const cam = $("cam").value;
+  const j = await (await fetch("/api/live?cam=" + cam)).json();
+  if (!j.url) { $("info").textContent = "This camera is not recording right now."; return; }
+  if (j.url !== currentUrl) return play(j.url, true);
+  followLive = true;
+  const r = v.seekable;
+  if (r.length) v.currentTime = (hls && hls.liveSyncPosition) || r.end(r.length - 1) - 1;
+}
+
+$("back").onclick = () => seekBy(-10);
+$("fwd").onclick = () => seekBy(10);
+$("live").onclick = goLive;
+
+v.addEventListener("timeupdate", () => {
+  const d = hls && hls.playingDate;
+  $("clock").textContent = d ? d.toLocaleString() : "";
+});
+
+function highlight() {
+  document.querySelectorAll("#sessions button").forEach(b => b.classList.toggle("active", b.dataset.url === currentUrl));
+}
+
+function renderSessions() {
+  const day = daysData.find(d => d.date === $("day").value);
+  const box = $("sessions");
+  box.innerHTML = "";
+  if (!day) return;
+  for (const s of day.sessions) {
+    const b = document.createElement("button");
+    b.dataset.url = s.url;
+    b.textContent = s.name + (s.live ? "  (live)" : "");
+    b.onclick = () => play(s.url, s.live);
+    box.appendChild(b);
+  }
+  highlight();
+}
+
+async function loadDays() {
+  const cam = $("cam").value;
+  if (!cam) return;
+  daysData = (await (await fetch("/api/days?cam=" + cam)).json()).days;
+  const sel = $("day"), keep = sel.value;
+  sel.innerHTML = daysData.map(d => `<option>${d.date}</option>`).join("");
+  if (daysData.some(d => d.date === keep)) sel.value = keep;
+  renderSessions();
+}
+
+async function loadCams() {
+  const j = await (await fetch("/api/cameras")).json();
+  const sel = $("cam"), keep = sel.value;
+  sel.innerHTML = j.cameras.map(c => `<option>${c}${j.online.includes(c) ? "" : ""}</option>`).join("");
+  if (j.cameras.includes(keep)) sel.value = keep;
+  $("dot").classList.toggle("on", j.online.includes(sel.value));
+}
+
+$("cam").onchange = async () => { await loadDays(); goLive(); };
+$("day").onchange = renderSessions;
+
+async function refresh() {
+  await loadCams();
+  await loadDays();
+  // hour rolled over -> a new playlist started: follow it if we are watching live
+  if (followLive) {
+    const j = await (await fetch("/api/live?cam=" + $("cam").value)).json();
+    if (j.url && j.url !== currentUrl) play(j.url, true);
+  }
+}
+
+(async () => {
+  await loadCams();
+  await loadDays();
+  const j = $("cam").value ? await (await fetch("/api/live?cam=" + $("cam").value)).json() : {};
+  if (j.url) play(j.url, true);
+  else $("info").textContent = "Camera is not live. Pick a day and a recording below.";
+  setInterval(refresh, 15000);
+})();
+</script>
+</body>
+</html>

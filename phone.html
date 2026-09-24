@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 14px; background: #111; color: #eee; }
+  video { width: 100%; max-height: 62vh; background: #000; border-radius: 8px; }
+  button { font-size: 17px; padding: 11px 18px; margin: 8px 8px 8px 0; border: 0; border-radius: 8px; }
+  #start { background: #2e7d32; color: #fff; } #stop { background: #c62828; color: #fff; }
+  #status { margin-top: 6px; font-size: 14px; color: #8bc; }
+  small { color: #888; }
+</style>
+</head>
+<body>
+<h3 style="margin:4px 0 10px">Camera: <span id="camname"></span></h3>
+<video id="preview" autoplay muted playsinline></video>
+<div>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="flip">Flip</button>
+</div>
+<div id="status">Idle</div>
+<small>Keep this screen open and the phone plugged in. Add <code>?cam=name</code> to the URL to name the camera,
+and <code>&amp;auto=1</code> to start automatically.</small>
+
+<script>
+const params = new URLSearchParams(location.search);
+const CAM = params.get("cam") || "phone1";
+document.getElementById("camname").textContent = CAM;
+
+const $ = id => document.getElementById(id);
+const setStatus = t => $("status").textContent = t;
+
+let stream = null, pc = null, running = false, facing = "environment";
+let wakeLock = null, retryTimer = null;
+
+async function openCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15 } },
+    audio: { echoCancellation: true, noiseSuppression: true }   // microphone
+  });
+  $("preview").srcObject = stream;
+}
+
+function iceComplete(pc) {
+  return new Promise(resolve => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    const done = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", done);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", done);
+    setTimeout(resolve, 3000);           // don't wait forever
+  });
+}
+
+async function connect() {
+  clearTimeout(retryTimer);
+  if (pc) { pc.onconnectionstatechange = null; pc.close(); }
+  // Same Wi-Fi needs no STUN. For cloud / outside-network use, add:
+  //   iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+  pc = new RTCPeerConnection({ iceServers: [] });
+  stream.getTracks().forEach(t => pc.addTrack(t, stream));   // video + audio
+
+  pc.onconnectionstatechange = () => {
+    setStatus("Connection: " + pc.connectionState);
+    if (running && ["failed", "closed", "disconnected"].includes(pc.connectionState)) scheduleRetry();
+  };
+
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    await iceComplete(pc);
+    const res = await fetch("/offer?cam=" + encodeURIComponent(CAM), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+    });
+    if (!res.ok) throw new Error("server said " + res.status);
+    await pc.setRemoteDescription(await res.json());
+  } catch (e) {
+    setStatus("Error: " + e.message);
+    if (running) scheduleRetry();
+  }
+}
+
+function scheduleRetry() {
+  clearTimeout(retryTimer);
+  setStatus("Reconnecting in 3s...");
+  retryTimer = setTimeout(() => running && connect(), 3000);
+}
+
+async function start() {
+  try {
+    await openCamera();
+    running = true;
+    $("start").disabled = true; $("stop").disabled = false;
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+    await connect();
+  } catch (e) { setStatus("Error: " + e.message); }
+}
+
+function stop() {
+  running = false;
+  clearTimeout(retryTimer);
+  if (pc) { pc.onconnectionstatechange = null; pc.close(); pc = null; }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (wakeLock) wakeLock.release();
+  $("start").disabled = false; $("stop").disabled = true;
+  setStatus("Stopped");
+}
+
+$("start").onclick = start;
+$("stop").onclick = stop;
+$("flip").onclick = async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  if (running) { await openCamera(); await connect(); }
+};
+
+document.addEventListener("visibilitychange", async () => {
+  if (running && document.visibilityState === "visible") {
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+    if (!pc || pc.connectionState !== "connected") connect();
+  }
+});
+
+if (params.get("auto") === "1") start();
+</script>
+</body>
+</html>
